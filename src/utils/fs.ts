@@ -1,17 +1,28 @@
 import RNFS from 'react-native-fs'
-import {
+import { Platform } from 'react-native'
+import type {
+  FileType,
+  OpenDocumentOptions,
+  Encoding,
+  HashAlgorithm,
+} from 'react-native-file-system'
+
+type FSModule = typeof import('react-native-file-system')
+
+// `react-native-file-system` 只有 Android 原生实现。iOS 上模块初始化会抛
+// LINKING_ERROR 直接崩溃，所以 iOS 用 react-native-fs 实现的等价模块。
+const fsModule: FSModule = Platform.OS === 'ios'
+  ? require('./fsIOS')
+  : require('react-native-file-system')
+
+const {
   Dirs,
   FileSystem,
   AndroidScoped,
-  type OpenDocumentOptions,
-  type Encoding,
-  type HashAlgorithm,
-  getExternalStoragePaths as _getExternalStoragePaths,
-} from 'react-native-file-system'
+  getExternalStoragePaths: _getExternalStoragePaths,
+} = fsModule
 
-export type {
-  FileType,
-} from 'react-native-file-system'
+export type { FileType }
 
 // export const externalDirectoryPath = RNFS.ExternalDirectoryPath
 
