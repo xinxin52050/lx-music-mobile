@@ -1,0 +1,207 @@
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      bundle_id:
+        description: 'Bundle ID (安装冲突时改这个)'
+        required: false
+        default: 'com.lxmusic.mobile'
+      sign_mode:
+        description: 'none = 未签名 IPA (用 AltStore/SideStore/Sideloadly/TrollStore 安装) ; adhoc = 用 Secrets 中的证书签名'
+        type: choice
+        options:
+          - none
+          - adhoc
+        default: none
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SCHEME: LxMusicMobile
+  APP_NAME: LxMusicMobile
+  CERT_B64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+  CERT_PASSWORD: ${{ secrets.P12_PASSWORD }}
+  PROFILE_B64: ${{ secrets.PROVISIONING_PROFILE_BASE64 }}
+  SIGN_MODE: ${{ inputs.sign_mode }}
+  BUNDLE_ID: ${{ inputs.bundle_id }}
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show available Xcode
+        run: ls /Applications | grep -i '^Xcode' || true
+
+      - name: Select Xcode
+        run: |
+          set -e
+          for v in 15.4 15.3 15.2 15.1 15.0.1 16.0 16.1 16.2 16.3 16.4 17.0 26.0 26.1; do
+            if [ -d "/Applications/Xcode_${v}.app" ]; then
+              sudo xcode-select -s "/Applications/Xcode_${v}.app/Contents/Developer"
+              echo "Using Xcode ${v}"
+              break
+            fi
+          done
+          xcodebuild -version
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install JS dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Install CocoaPods dependencies
+        working-directory: ios
+        env:
+          RCT_NEW_ARCH_ENABLED: '0'
+          NO_FLIPPER: '1'
+        run: |
+          command -v pod >/dev/null 2>&1 || sudo gem install cocoapods
+          pod --version
+          pod install --repo-update
+
+      - name: Build (Release, device, unsigned)
+        env:
+          RCT_NEW_ARCH_ENABLED: '0'
+          NO_FLIPPER: '1'
+        run: |
+          set -o pipefail
+          BID="${BUNDLE_ID:-com.lxmusic.mobile}"
+          echo "Bundle ID: $BID"
+          xcodebuild \
+            -workspace ios/${SCHEME}.xcworkspace \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            ENABLE_USER_SCRIPT_SANDBOXING=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            ONLY_ACTIVE_ARCH=NO \
+            PRODUCT_BUNDLE_IDENTIFIER="$BID" \
+            build 2>&1 | tee build.log
+
+      - name: Locate app bundle
+        run: |
+          set -e
+          APP="build/Build/Products/Release-iphoneos/${APP_NAME}.app"
+          if [ ! -d "$APP" ]; then
+            echo "::error::未找到 $APP"
+            ls -R build/Build/Products || true
+            exit 1
+          fi
+          echo "APP_PATH=$APP" >> "$GITHUB_ENV"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist" || true
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist" || true
+          du -sh "$APP"
+          ls "$APP/main.jsbundle" || echo "::warning::没有 main.jsbundle，App 可能无法离线运行"
+
+      - name: Re-sign with user certificate (optional)
+        if: env.SIGN_MODE == 'adhoc'
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CERT_B64:-}" ] || [ -z "${PROFILE_B64:-}" ]; then
+            echo "::warning::sign_mode=adhoc 但缺少 BUILD_CERTIFICATE_BASE64 / PROVISIONING_PROFILE_BASE64，跳过签名"
+            exit 0
+          fi
+
+          KEYCHAIN="build-signing.keychain-db"
+          security create-keychain -p actions "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p actions "$KEYCHAIN"
+          security default-keychain -s "$KEYCHAIN"
+
+          printf '%s' "$CERT_B64" | base64 --decode > cert.p12
+          security import cert.p12 -P "$CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple: -s -k actions "$KEYCHAIN"
+
+          printf '%s' "$PROFILE_B64" | base64 --decode > profile.mobileprovision
+          security cms -D -i profile.mobileprovision > profile.plist
+          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' profile.plist)
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp profile.mobileprovision "$HOME/Library/MobileDevice/Provisioning Profiles/${PROFILE_UUID}.mobileprovision"
+          /usr/libexec/PlistBuddy -x -c 'Print :Entitlements' profile.plist > entitlements.plist
+
+          APP="$APP_PATH"
+          cp profile.mobileprovision "$APP/embedded.mobileprovision"
+
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" | sed -n '1s/.*"\(.*\)"/\1/p')
+          echo "Signing identity: $IDENTITY"
+          [ -n "$IDENTITY" ] || { echo "::error::未在 p12 中找到可用的签名身份"; exit 1; }
+
+          if [ -d "$APP/Frameworks" ]; then
+            find "$APP/Frameworks" -maxdepth 2 -name "*.framework" -print0 | while IFS= read -r -d '' fw; do
+              codesign --force --timestamp=none --sign "$IDENTITY" "$fw" 2>/dev/null || true
+            done
+            find "$APP/Frameworks" -maxdepth 2 -name "*.dylib" -print0 | while IFS= read -r -d '' dy; do
+              codesign --force --timestamp=none --sign "$IDENTITY" "$dy" 2>/dev/null || true
+            done
+          fi
+
+          codesign --force --timestamp=none --sign "$IDENTITY" --entitlements entitlements.plist "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP" || echo "::warning::codesign 校验有告警"
+          echo "SIGNED=1" >> "$GITHUB_ENV"
+
+      - name: Package IPA
+        run: |
+          set -e
+          VERSION=$(node -p "require('./package.json').version")
+          if [ "${SIGNED:-0}" = "1" ]; then SUFFIX="signed"; else SUFFIX="unsigned"; fi
+          IPA="LXMusic-${VERSION}-ios-${SUFFIX}.ipa"
+          rm -rf dist && mkdir -p dist/Payload
+          cp -R "$APP_PATH" dist/Payload/
+          cd dist
+          zip -qry "../${IPA}" Payload
+          cd ..
+          ls -lh "$IPA"
+          echo "IPA_PATH=$IPA" >> "$GITHUB_ENV"
+          echo "IPA_NAME=$IPA" >> "$GITHUB_ENV"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lx-music-ios-ipa
+          path: ${{ env.IPA_PATH }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Publish GitHub Release
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          VERSION=$(node -p "require('./package.json').version")
+          TAG="ios-v${VERSION}-build${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" "$IPA_PATH" \
+            --title "LX Music iOS ${VERSION} (${IPA_NAME})" \
+            --notes "由 GitHub Actions 自动构建，来源 lywhut/lx-music-mobile @ ${GITHUB_SHA}. IPA: ${IPA_NAME}" \
+            --target "$GITHUB_SHA"
+          echo "Release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
